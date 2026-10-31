@@ -1,0 +1,11 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running unittests src/lib.rs (target/debug/deps/tests_mix-c3d477b1c8a0fbb6)
+error: test failed, to rerun pass `--lib`
+     Running tests/integ.rs (target/debug/deps/integ-0d27ff1bf7b0bdac)
+error: test failed, to rerun pass `--test integ`
+   Doc-tests tests_mix
+error: doctest failed, to rerun pass `--doc`
+error: 3 targets failed:
+    `--lib`
+    `--test integ`
+    `--doc`

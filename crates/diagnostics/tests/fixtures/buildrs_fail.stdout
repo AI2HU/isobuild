@@ -1,0 +1,2 @@
+{"reason":"compiler-artifact","package_id":"path+file:///work#0.1.0","manifest_path":"/work/Cargo.toml","target":{"kind":["custom-build"],"crate_types":["bin"],"name":"build-script-build","src_path":"/work/build.rs","edition":"2024","doc":false,"doctest":false,"test":false},"profile":{"opt_level":"0","debuginfo":0,"debug_assertions":true,"overflow_checks":true,"test":false},"features":[],"filenames":["/work/target/debug/build/buildrs_fail-c32bcfd53a975bba/build-script-build"],"executable":null,"fresh":false}
+{"reason":"build-finished","success":false}

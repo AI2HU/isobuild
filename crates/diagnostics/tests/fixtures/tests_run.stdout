@@ -1,0 +1,78 @@
+
+running 5 tests
+test tests::ignored_one ... ignored, slow
+test tests::passes ... ok
+test tests::should_panic_but_doesnt - should panic ... FAILED
+test tests::fails_eq ... FAILED
+test tests::panics_msg ... FAILED
+
+failures:
+
+---- tests::should_panic_but_doesnt stdout ----
+note: test did not panic as expected at src/lib.rs:15:32
+---- tests::fails_eq stdout ----
+
+thread 'tests::fails_eq' (31412790) panicked at src/lib.rs:12:29:
+assertion `left == right` failed
+  left: 3
+ right: 4
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- tests::panics_msg stdout ----
+some captured output
+
+thread 'tests::panics_msg' (31412791) panicked at src/lib.rs:13:65:
+boom: 42
+
+
+failures:
+    tests::fails_eq
+    tests::panics_msg
+    tests::should_panic_but_doesnt
+
+test result: FAILED. 1 passed; 3 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 2 tests
+test integ_ok ... ok
+test integ_fail ... FAILED
+
+failures:
+
+---- integ_fail stdout ----
+
+thread 'integ_fail' (31412811) panicked at tests/integ.rs:2:62:
+index out of bounds: the len is 0 but the index is 3
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    integ_fail
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 1 test
+test src/lib.rs - add (line 3) ... FAILED
+
+failures:
+
+---- src/lib.rs - add (line 3) stdout ----
+Test executable failed (exit status: 101).
+
+stderr:
+
+thread 'main' (31413200) panicked at /tmp/rustdoctestT4pOeT/doctest_bundle_2024.rs:6:1:
+assertion `left == right` failed
+  left: 2
+ right: 3
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+
+failures:
+    src/lib.rs - add (line 3)
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+all doctests ran in 1.63s; merged doctests compilation took 1.12s

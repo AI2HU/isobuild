@@ -1,0 +1,11 @@
+   Compiling buildrs_fail v0.1.0 (/work)
+warning: buildrs_fail@0.1.0: about to fail
+error: failed to run custom build command for `buildrs_fail v0.1.0 (/work)`
+
+Caused by:
+  process didn't exit successfully: `/work/target/debug/build/buildrs_fail-c32bcfd53a975bba/build-script-build` (exit status: 1)
+  --- stdout
+  cargo:warning=about to fail
+
+  --- stderr
+  could not find libfoo
