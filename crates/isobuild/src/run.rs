@@ -11,18 +11,18 @@ use isobuild_report::{
     Status,
 };
 
-use crate::backend::{Backend, BackendError, ContainerOutcome, ContainerSpec, Mount};
-use crate::cache::{CacheLayout, build_cache_key, default_scope};
+use crate::backend::{Backend, BackendError, SandboxOutcome, SandboxSpec};
+use crate::cache::{CacheLayout, build_cache_key, default_scope, remove_tree};
 use crate::request::{CargoCommand, RunRequest};
 use crate::stage::{StageError, copy_project};
-
-/// Where the project lives inside the sandbox. Diagnostics are relative to it.
-pub const WORKDIR: &str = "/work";
-const CARGO_HOME: &str = "/cargo-home";
-const TARGET_DIR: &str = "/target";
+use crate::toolchain::Toolchain;
 
 const RUN_LOG_RETENTION: Duration = Duration::from_secs(3 * 24 * 3600);
 const BUILD_CACHE_RETENTION: Duration = Duration::from_secs(14 * 24 * 3600);
+
+/// Directories of a run directory that hold sandbox data, deleted after the
+/// run. Everything else in it is logs.
+const SCRATCH_DIRS: [&str; 5] = ["work", "tmp", "cargo-home", "bin", "target"];
 
 /// Why a run stopped early.
 struct Stop {
@@ -103,43 +103,50 @@ fn execute(
         ));
     }
 
-    backend.preflight().map_err(infra(Phase::Prepare))?;
-    let image_id = backend
-        .ensure_image(&req.image)
-        .map_err(infra(Phase::Prepare))?;
-    report.environment = Some(Environment {
-        image: req.image.clone(),
-        image_id: image_id.clone(),
-        limits: req.limits.clone(),
-    });
-
-    let layout = CacheLayout::new(&req.cache_dir);
     let io_failure = |what: &'static str| {
         move |err: std::io::Error| {
             Stop::because(Status::InfraError, Phase::Prepare, format!("{what}: {err}"))
         }
     };
-    layout
+    CacheLayout::new(&req.cache_dir)
         .ensure()
         .map_err(io_failure("could not create the cache directory"))?;
-    for key in layout
-        .prune(RUN_LOG_RETENTION, BUILD_CACHE_RETENTION)
-        .targets
-    {
-        backend.remove_volume(&target_volume(&key));
+    // Sandbox rules match resolved paths, so every path starts canonical.
+    let layout = CacheLayout::new(
+        req.cache_dir
+            .canonicalize()
+            .map_err(io_failure("could not resolve the cache directory"))?,
+    );
+
+    backend.preflight().map_err(infra(Phase::Prepare))?;
+    let toolchain = backend
+        .toolchain(req.toolchain.as_deref(), layout.root())
+        .map_err(infra(Phase::Prepare))?;
+    report.environment = Some(Environment {
+        backend: backend.name().to_string(),
+        toolchain: toolchain.version.clone(),
+        toolchain_id: toolchain.id.clone(),
+        limits: req.limits.clone(),
+    });
+    if req.command == CargoCommand::Clippy && !toolchain.has_clippy() {
+        return Err(Stop::because(
+            Status::InfraError,
+            Phase::Prepare,
+            "clippy is not installed for this toolchain; install it with `rustup component add clippy`",
+        ));
     }
-    let (run_id, run_dir) = layout
+
+    layout.prune(RUN_LOG_RETENTION, BUILD_CACHE_RETENTION);
+    let (_, run_dir) = layout
         .new_run_dir()
         .map_err(io_failure("could not create the run directory"))?;
     report.log_dir = Some(run_dir.display().to_string());
-
-    let work = run_dir.join("work");
-    let mut cleanup = RunCleanup {
-        backend,
+    let _cleanup = RunCleanup {
         run_dir: run_dir.clone(),
         keep_staging: req.keep_staging,
-        volume: None,
     };
+
+    let work = run_dir.join("work");
     copy_project(&req.project, &work, &policy.excluded, req.max_project_bytes).map_err(|err| {
         match err {
             StageError::TooLarge { .. } => {
@@ -152,45 +159,39 @@ fn execute(
             ),
         }
     })?;
+    let dirs = RunDirs::create(&run_dir, &layout, &toolchain)
+        .map_err(io_failure("could not prepare the sandbox directories"))?;
 
-    // Build output goes to a volume: it is written by project code, and on
-    // macOS it is far faster (and safer) than a host directory.
-    let user = owner_of(layout.root());
     let target = if req.build_cache {
         let scope = req
             .cache_scope
             .clone()
             .unwrap_or_else(|| default_scope(&req.project));
-        let key = build_cache_key(&scope, &image_id);
-        let volume = target_volume(&key);
-        let warm = backend
-            .ensure_volume(&volume, user.as_deref(), &image_id)
-            .map_err(infra(Phase::Prepare))?;
-        fs::create_dir_all(layout.target(&key))
-            .map_err(io_failure("could not create the build cache"))?;
+        let key = build_cache_key(&scope, &toolchain.id);
+        let target = layout.target_dir(&key);
+        let warm = target.is_dir();
+        fs::create_dir_all(&target).map_err(io_failure("could not create the build cache"))?;
         layout
             .touch_target(&key)
             .map_err(io_failure("could not update the build cache"))?;
         report.cache = Some(CacheInfo { key, warm });
-        volume
+        target
     } else {
-        let volume = format!("isobuild-run-{run_id}");
-        cleanup.volume = Some(volume.clone());
-        backend
-            .ensure_volume(&volume, user.as_deref(), &image_id)
-            .map_err(infra(Phase::Prepare))?;
-        volume
+        let target = run_dir.join("target");
+        fs::create_dir(&target).map_err(io_failure("could not create the target directory"))?;
+        target
     };
 
     let phases = Phases {
         req,
         backend,
-        run_id,
+        toolchain: &toolchain,
         run_dir,
-        image_id,
-        user,
-        work,
+        work: work.clone(),
+        dirs,
     };
+    // Diagnostics name files relative to the staged copy.
+    let root = work.display().to_string();
 
     // Fetch: network on, cargo only.
     let fetched = !req.offline;
@@ -202,20 +203,23 @@ fn execute(
                 format!("could not lock the dependency cache: {err}"),
             )
         })?;
-        let mut command = vec!["cargo".to_string(), "fetch".to_string()];
+        let mut args = vec!["fetch".to_string()];
         if req.cargo.locked {
-            command.push("--locked".into());
+            args.push("--locked".into());
         }
-        let mounts = vec![
-            phases.mount_work(),
-            Mount::host(layout.cargo_home(), CARGO_HOME, false),
-        ];
-        let spec = phases.spec(Phase::Fetch, command, mounts, true, Vec::new());
+        let spec = phases.spec(
+            Phase::Fetch,
+            args,
+            &layout.cargo_home(),
+            None,
+            Vec::new(),
+            vec![layout.cargo_home()],
+        );
         let outcome = phases.run(Phase::Fetch, &spec, report)?;
         check_limits(&outcome, Phase::Fetch)?;
         if outcome.exit_code != Some(0) {
             let stderr = read_log(&spec.stderr_path);
-            let errors = parse_cargo_stderr(&stderr, WORKDIR, false);
+            let errors = parse_cargo_stderr(&stderr, &root, false);
             let network = looks_like_network_error(&stderr);
             diagnostics.extend(errors);
             if network {
@@ -231,23 +235,22 @@ fn execute(
     }
 
     // Build: network off, project code runs (build scripts, proc macros).
-    let build_mounts = vec![
-        phases.mount_work(),
-        Mount::host(layout.registry(), format!("{CARGO_HOME}/registry"), true),
-        Mount::host(layout.git(), format!("{CARGO_HOME}/git"), true),
-        Mount::volume(target, TARGET_DIR),
-    ];
-    let spec = phases.spec(
-        Phase::Build,
-        cargo_command(req, Phase::Build, fetched),
-        build_mounts.clone(),
-        false,
-        sandboxed_env(req),
-    );
+    // The shared dependency cache is read-only from here on.
+    let offline_spec = |phase| {
+        phases.spec(
+            phase,
+            cargo_args(req, phase, fetched),
+            &phases.dirs.cargo_home,
+            Some(&target),
+            vec![layout.registry(), layout.git()],
+            vec![phases.dirs.cargo_home.clone(), target.clone()],
+        )
+    };
+    let spec = offline_spec(Phase::Build);
     let outcome = phases.run(Phase::Build, &spec, report)?;
     let stdout = read_log(&spec.stdout_path);
     let stderr = read_log(&spec.stderr_path);
-    diagnostics.extend(parse_cargo_messages(&stdout, WORKDIR));
+    diagnostics.extend(parse_cargo_messages(&stdout, &root));
     check_limits(&outcome, Phase::Build)?;
     if outcome.exit_code != Some(0) {
         if stderr.contains("error: no such command") {
@@ -255,33 +258,26 @@ fn execute(
                 Status::InfraError,
                 Phase::Build,
                 format!(
-                    "the image `{}` does not provide `cargo {}`",
-                    req.image,
+                    "the toolchain does not provide `cargo {}`",
                     req.command.as_str()
                 ),
             ));
         }
-        diagnostics.extend(parse_cargo_stderr(&stderr, WORKDIR, true));
+        diagnostics.extend(parse_cargo_stderr(&stderr, &root, true));
         ensure_error(diagnostics, "the build", &outcome);
         return Err(Stop::new(Status::BuildFailed, Phase::Build));
     }
     // Keep cargo's own warnings, such as `cargo:warning=` from build scripts.
-    diagnostics.extend(parse_cargo_stderr(&stderr, WORKDIR, true));
+    diagnostics.extend(parse_cargo_stderr(&stderr, &root, true));
     if req.command != CargoCommand::Test {
         return Ok(());
     }
 
     // Test: network off.
-    let spec = phases.spec(
-        Phase::Test,
-        cargo_command(req, Phase::Test, fetched),
-        build_mounts,
-        false,
-        sandboxed_env(req),
-    );
+    let spec = offline_spec(Phase::Test);
     let outcome = phases.run(Phase::Test, &spec, report)?;
     let stdout = read_log(&spec.stdout_path);
-    let tests = parse_libtest(&stdout, WORKDIR, req.max_test_failures);
+    let tests = parse_libtest(&stdout, &root, req.max_test_failures);
     let failed = tests.failed;
     report.tests = Some(tests);
     check_limits(&outcome, Phase::Test)?;
@@ -290,7 +286,7 @@ fn execute(
             // A crashed test binary or a doctest that failed to build.
             diagnostics.extend(parse_cargo_stderr(
                 &read_log(&spec.stderr_path),
-                WORKDIR,
+                &root,
                 false,
             ));
             ensure_error(diagnostics, "the tests", &outcome);
@@ -300,30 +296,70 @@ fn execute(
     Ok(())
 }
 
-/// Builds container specs that share the run's settings.
+/// The sandbox's private directories inside a run directory.
+struct RunDirs {
+    /// `HOME` and `TMPDIR`.
+    tmp: PathBuf,
+    /// `CARGO_HOME` for build and test: writable for cargo's locks and
+    /// caches, with `registry` and `git` linked to the shared, read-only ones.
+    cargo_home: PathBuf,
+    /// Extra programs for `PATH`, as links to the toolchain's tools.
+    bin: Option<PathBuf>,
+}
+
+impl RunDirs {
+    fn create(
+        run_dir: &Path,
+        layout: &CacheLayout,
+        toolchain: &Toolchain,
+    ) -> std::io::Result<Self> {
+        use std::os::unix::fs::symlink;
+        let tmp = run_dir.join("tmp");
+        fs::create_dir(&tmp)?;
+        let cargo_home = run_dir.join("cargo-home");
+        fs::create_dir(&cargo_home)?;
+        symlink(layout.registry(), cargo_home.join("registry"))?;
+        symlink(layout.git(), cargo_home.join("git"))?;
+        let bin = if toolchain.tools.is_empty() {
+            None
+        } else {
+            let bin = run_dir.join("bin");
+            fs::create_dir(&bin)?;
+            for (name, path) in &toolchain.tools {
+                symlink(path, bin.join(name))?;
+            }
+            Some(bin)
+        };
+        Ok(RunDirs {
+            tmp,
+            cargo_home,
+            bin,
+        })
+    }
+}
+
+/// Builds sandbox specs that share the run's settings.
 struct Phases<'a> {
     req: &'a RunRequest,
     backend: &'a dyn Backend,
-    run_id: String,
+    toolchain: &'a Toolchain,
     run_dir: PathBuf,
-    image_id: String,
-    user: Option<String>,
     work: PathBuf,
+    dirs: RunDirs,
 }
 
 impl Phases<'_> {
-    fn mount_work(&self) -> Mount {
-        Mount::host(self.work.clone(), WORKDIR, false)
-    }
-
+    /// A spec running `cargo <args>`. The staged project and the private
+    /// temporary directory are always writable; the toolchain is always readable.
     fn spec(
         &self,
         phase: Phase,
-        command: Vec<String>,
-        mounts: Vec<Mount>,
-        network: bool,
-        extra_env: Vec<(String, String)>,
-    ) -> ContainerSpec {
+        args: Vec<String>,
+        cargo_home: &Path,
+        target: Option<&Path>,
+        read_only: Vec<PathBuf>,
+        writable: Vec<PathBuf>,
+    ) -> SandboxSpec {
         let name = phase_name(phase);
         let limits = &self.req.limits;
         let timeout = match phase {
@@ -331,26 +367,62 @@ impl Phases<'_> {
             Phase::Build => limits.build_timeout_secs,
             Phase::Test => limits.test_timeout_secs,
         };
-        let mut env = base_env();
-        env.extend(extra_env);
-        let mut tmpfs = vec![("/tmp".to_string(), 1024)];
-        if !network {
-            // Build and test only see registry/ and git/ of the shared cargo home;
-            // the rest (locks, cache database) lives in memory.
-            tmpfs.push((CARGO_HOME.to_string(), 64));
+
+        let mut path = Vec::new();
+        path.extend(self.dirs.bin.iter().map(|b| b.display().to_string()));
+        path.push(self.toolchain.bin_dir().display().to_string());
+        path.extend(["/usr/bin".to_string(), "/bin".to_string()]);
+        let tmp = self.dirs.tmp.display().to_string();
+        let mut env = vec![
+            ("PATH".to_string(), path.join(":")),
+            ("HOME".to_string(), tmp.clone()),
+            ("TMPDIR".to_string(), tmp),
+            ("CARGO_HOME".to_string(), cargo_home.display().to_string()),
+            ("CARGO_TERM_COLOR".to_string(), "never".to_string()),
+            ("CARGO_TERM_PROGRESS_WHEN".to_string(), "never".to_string()),
+            (
+                "CARGO_BUILD_JOBS".to_string(),
+                (limits.cpus.ceil() as u64).max(1).to_string(),
+            ),
+            (
+                "RUSTC".to_string(),
+                self.toolchain.bin_dir().join("rustc").display().to_string(),
+            ),
+            (
+                "RUSTDOC".to_string(),
+                self.toolchain
+                    .bin_dir()
+                    .join("rustdoc")
+                    .display()
+                    .to_string(),
+            ),
+        ];
+        if let Some(target) = target {
+            env.push(("CARGO_TARGET_DIR".to_string(), target.display().to_string()));
         }
-        ContainerSpec {
-            name: format!("isobuild-{}-{name}", self.run_id),
-            image: self.image_id.clone(),
+        env.extend(self.toolchain.env.iter().cloned());
+        if phase != Phase::Fetch {
+            env.push(("CARGO_NET_OFFLINE".to_string(), "true".to_string()));
+            env.extend(self.req.env.iter().cloned());
+        }
+
+        let mut command = vec![self.toolchain.cargo().display().to_string()];
+        command.extend(args);
+        let mut all_read_only = self.toolchain.read_only.clone();
+        all_read_only.extend(self.dirs.bin.iter().cloned());
+        all_read_only.extend(read_only);
+        let mut all_writable = vec![self.work.clone(), self.dirs.tmp.clone()];
+        all_writable.extend(writable);
+
+        SandboxSpec {
+            name: name.to_string(),
             command,
             env,
-            mounts,
-            tmpfs,
-            network,
-            workdir: WORKDIR.into(),
-            user: self.user.clone(),
+            workdir: self.work.clone(),
+            read_only: all_read_only,
+            writable: all_writable,
+            network: phase == Phase::Fetch,
             memory_mb: limits.memory_mb,
-            cpus: limits.cpus,
             pids: limits.pids,
             timeout: Duration::from_secs(timeout),
             stdout_path: self.run_dir.join(format!("{name}.stdout.log")),
@@ -363,9 +435,9 @@ impl Phases<'_> {
     fn run(
         &self,
         phase: Phase,
-        spec: &ContainerSpec,
+        spec: &SandboxSpec,
         report: &mut Report,
-    ) -> Result<ContainerOutcome, Stop> {
+    ) -> Result<SandboxOutcome, Stop> {
         let outcome = self.backend.run(spec).map_err(infra(phase))?;
         report.phases.push(PhaseOutcome {
             phase,
@@ -373,6 +445,7 @@ impl Phases<'_> {
             duration_ms: outcome.duration.as_millis() as u64,
             timed_out: outcome.timed_out,
             oom_killed: outcome.oom_killed,
+            process_limit_hit: outcome.process_limit_hit,
             output_truncated: outcome.output_truncated,
         });
         Ok(outcome)
@@ -388,29 +461,9 @@ fn phase_name(phase: Phase) -> &'static str {
     }
 }
 
-fn base_env() -> Vec<(String, String)> {
-    [
-        ("CARGO_HOME", CARGO_HOME),
-        ("CARGO_TARGET_DIR", TARGET_DIR),
-        ("CARGO_TERM_COLOR", "never"),
-        ("CARGO_TERM_PROGRESS_WHEN", "never"),
-        ("HOME", "/tmp"),
-        ("TMPDIR", "/tmp"),
-    ]
-    .into_iter()
-    .map(|(k, v)| (k.to_string(), v.to_string()))
-    .collect()
-}
-
-fn sandboxed_env(req: &RunRequest) -> Vec<(String, String)> {
-    let mut env = vec![("CARGO_NET_OFFLINE".to_string(), "true".to_string())];
-    env.extend(req.env.iter().cloned());
-    env
-}
-
-/// The cargo invocation for the build or test phase.
-fn cargo_command(req: &RunRequest, phase: Phase, fetched: bool) -> Vec<String> {
-    let mut args = vec!["cargo".to_string()];
+/// Cargo's arguments for the build or test phase.
+fn cargo_args(req: &RunRequest, phase: Phase, fetched: bool) -> Vec<String> {
+    let mut args = Vec::new();
     match (req.command, phase) {
         (CargoCommand::Test, Phase::Build) => args.extend(["test".into(), "--no-run".into()]),
         (command, _) => args.push(command.as_str().into()),
@@ -438,9 +491,12 @@ fn cargo_command(req: &RunRequest, phase: Phase, fetched: bool) -> Vec<String> {
     args
 }
 
-fn check_limits(outcome: &ContainerOutcome, phase: Phase) -> Result<(), Stop> {
+fn check_limits(outcome: &SandboxOutcome, phase: Phase) -> Result<(), Stop> {
     if outcome.oom_killed {
         return Err(Stop::new(Status::Oom, phase));
+    }
+    if outcome.process_limit_hit {
+        return Err(Stop::new(Status::ProcessLimit, phase));
     }
     if outcome.timed_out {
         return Err(Stop::new(Status::Timeout, phase));
@@ -449,7 +505,7 @@ fn check_limits(outcome: &ContainerOutcome, phase: Phase) -> Result<(), Stop> {
 }
 
 /// Guarantee that a failed phase explains itself, even when nothing could be parsed.
-fn ensure_error(diagnostics: &mut Vec<Diagnostic>, what: &str, outcome: &ContainerOutcome) {
+fn ensure_error(diagnostics: &mut Vec<Diagnostic>, what: &str, outcome: &SandboxOutcome) {
     if diagnostics.iter().any(|d| d.level == Level::Error) {
         return;
     }
@@ -492,39 +548,19 @@ fn read_log(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// `uid:gid` of the cache directory's owner, so containers write files the
-/// host user can delete.
-#[cfg(unix)]
-fn owner_of(path: &Path) -> Option<String> {
-    use std::os::unix::fs::MetadataExt;
-    let meta = fs::metadata(path).ok()?;
-    Some(format!("{}:{}", meta.uid(), meta.gid()))
-}
-
-#[cfg(not(unix))]
-fn owner_of(_path: &Path) -> Option<String> {
-    None
-}
-
-fn target_volume(key: &str) -> String {
-    format!("isobuild-target-{key}")
-}
-
-/// Deletes the staged project and any throwaway target volume, keeping logs.
-struct RunCleanup<'a> {
-    backend: &'a dyn Backend,
+/// Deletes the run's sandbox directories when it ends, keeping its logs.
+struct RunCleanup {
     run_dir: PathBuf,
     keep_staging: bool,
-    volume: Option<String>,
 }
 
-impl Drop for RunCleanup<'_> {
+impl Drop for RunCleanup {
     fn drop(&mut self) {
-        if !self.keep_staging {
-            let _ = fs::remove_dir_all(self.run_dir.join("work"));
-        }
-        if let Some(volume) = &self.volume {
-            self.backend.remove_volume(volume);
+        for dir in SCRATCH_DIRS {
+            if dir == "work" && self.keep_staging {
+                continue;
+            }
+            let _ = remove_tree(&self.run_dir.join(dir));
         }
     }
 }
@@ -588,6 +624,11 @@ fn failure_summary(report: &Report, req: &RunRequest, phase: Phase) -> String {
             req.limits.memory_mb,
             phase_name(phase)
         ),
+        Status::ProcessLimit => format!(
+            "ran more than {} processes at once in the {} phase",
+            req.limits.pids,
+            phase_name(phase)
+        ),
         status => status.as_str().replace('_', " "),
     }
 }
@@ -610,9 +651,8 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            cargo_command(&req, Phase::Build, true),
+            cargo_args(&req, Phase::Build, true),
             [
-                "cargo",
                 "test",
                 "--no-run",
                 "--message-format=json",
@@ -621,9 +661,8 @@ mod tests {
             ]
         );
         assert_eq!(
-            cargo_command(&req, Phase::Test, true),
+            cargo_args(&req, Phase::Test, true),
             [
-                "cargo",
                 "test",
                 "--frozen",
                 "--release",
@@ -640,14 +679,8 @@ mod tests {
         let mut req = request(CargoCommand::Clippy);
         req.cargo.locked = true;
         assert_eq!(
-            cargo_command(&req, Phase::Build, false),
-            [
-                "cargo",
-                "clippy",
-                "--message-format=json",
-                "--offline",
-                "--locked"
-            ]
+            cargo_args(&req, Phase::Build, false),
+            ["clippy", "--message-format=json", "--offline", "--locked"]
         );
     }
 

@@ -13,7 +13,7 @@
 //!   one from a path inside the project.
 //!
 //! The first two are refused. Toolchain files are left out of the sandbox
-//! copy instead, so the image's pinned toolchain is always used.
+//! copy instead, so the toolchain chosen by the caller is always used.
 //!
 //! Settings that only take effect while compiling or testing (linkers,
 //! runners, `[env]`) are allowed: that code already runs without network,
@@ -45,7 +45,7 @@ const TOOLCHAIN_FILES: [&str; 2] = ["rust-toolchain.toml", "rust-toolchain"];
 /// Check the project rooted at `root`.
 ///
 /// Only the root's `.cargo` directory matters: the sandbox runs cargo from
-/// the root, and the directories above it belong to the image.
+/// the root, and the sandbox cannot read the directories above it.
 pub fn check_project(root: &Path) -> io::Result<ProjectPolicy> {
     let mut policy = ProjectPolicy::default();
 
@@ -95,7 +95,7 @@ pub fn check_project(root: &Path) -> io::Result<ProjectPolicy> {
             rule: "toolchain.file-ignored".into(),
             file: Some(file.into()),
             message: format!(
-                "{file} {requested}; it is left out of the sandbox and the image's pinned toolchain is used instead"
+                "{file} {requested}; it is left out of the sandbox and the toolchain chosen by the caller is used instead"
             ),
         });
         policy.excluded.push(PathBuf::from(file));

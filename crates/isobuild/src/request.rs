@@ -4,10 +4,6 @@ use std::path::PathBuf;
 
 use isobuild_report::Limits;
 
-/// Image used when the caller does not choose one. Pin it by digest in
-/// production (`rust@sha256:…`) so the toolchain cannot change under you.
-pub const DEFAULT_IMAGE: &str = "rust:1.91.1-slim-bookworm";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CargoCommand {
     Check,
@@ -83,7 +79,9 @@ pub struct RunRequest {
     pub test_args: Vec<String>,
     /// Extra environment for the build and test phases. Never inherited from the host.
     pub env: Vec<(String, String)>,
-    pub image: String,
+    /// Rustup toolchain to use, e.g. `stable` or `1.91.1`. `None` means the
+    /// host's default; a `rust-toolchain.toml` in the project is ignored.
+    pub toolchain: Option<String>,
     pub limits: Limits,
     /// Skip the fetch phase and build with `--offline` from what is already cached.
     pub offline: bool,
@@ -115,7 +113,7 @@ impl RunRequest {
             cargo: CargoOptions::default(),
             test_args: Vec::new(),
             env: Vec::new(),
-            image: DEFAULT_IMAGE.to_string(),
+            toolchain: None,
             limits: Limits::default(),
             offline: false,
             cache_dir: cache_dir.into(),
@@ -167,13 +165,17 @@ impl RunRequest {
     }
 }
 
-const RESERVED_ENV: [&str; 7] = [
+const RESERVED_ENV: [&str; 11] = [
     "CARGO_HOME",
     "CARGO_TARGET_DIR",
     "CARGO_BUILD_TARGET_DIR",
+    "CARGO_BUILD_JOBS",
     "CARGO_NET_OFFLINE",
     "HOME",
     "PATH",
+    "RUSTC",
+    "RUSTDOC",
+    "SDKROOT",
     "TMPDIR",
 ];
 

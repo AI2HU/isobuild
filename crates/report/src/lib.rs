@@ -7,15 +7,15 @@
 use serde::{Deserialize, Serialize};
 
 /// Version of the JSON layout described by [`Report`].
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Outcome of a run, from the agent's point of view.
 ///
 /// The variants separate "change your code" from "retry or report it":
 /// `invalid_request`, `policy_denied`, `fetch_failed`, `build_failed` and
 /// `test_failed` are caused by the submitted project; `infra_error` is not.
-/// `timeout` and `oom` are usually caused by the code but can also mean the
-/// limits are too tight for the project.
+/// `timeout`, `oom` and `process_limit` are usually caused by the code but can
+/// also mean the limits are too tight for the project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
@@ -27,6 +27,8 @@ pub enum Status {
     TestFailed,
     Timeout,
     Oom,
+    /// Too many processes at once, e.g. a fork bomb.
+    ProcessLimit,
     InfraError,
 }
 
@@ -41,6 +43,7 @@ impl Status {
             Status::TestFailed => "test_failed",
             Status::Timeout => "timeout",
             Status::Oom => "oom",
+            Status::ProcessLimit => "process_limit",
             Status::InfraError => "infra_error",
         }
     }
@@ -111,6 +114,8 @@ pub struct PhaseOutcome {
     pub duration_ms: u64,
     pub timed_out: bool,
     pub oom_killed: bool,
+    /// Killed for running more processes than the limit allows.
+    pub process_limit_hit: bool,
     /// True when stdout or stderr exceeded the capture limit.
     pub output_truncated: bool,
 }
@@ -236,16 +241,22 @@ pub struct PolicyFinding {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Environment {
-    pub image: String,
-    /// Content-addressed image id. Identifies the toolchain exactly.
-    pub image_id: String,
+    /// The sandbox that ran the code: `seatbelt` (macOS) or `bubblewrap` (Linux).
+    pub backend: String,
+    /// The Rust toolchain, as `rustc --version` prints it.
+    pub toolchain: String,
+    /// Hash identifying the toolchain exactly, including its install location.
+    pub toolchain_id: String,
     pub limits: Limits,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Limits {
+    /// Combined resident memory of every process in the sandbox.
     pub memory_mb: u64,
+    /// Parallelism: cargo runs this many jobs at once, rounded up.
     pub cpus: f64,
+    /// Processes running at once in the sandbox.
     pub pids: u32,
     pub fetch_timeout_secs: u64,
     pub build_timeout_secs: u64,
@@ -288,6 +299,7 @@ mod tests {
             Status::TestFailed,
             Status::Timeout,
             Status::Oom,
+            Status::ProcessLimit,
             Status::InfraError,
         ] {
             let json = serde_json::to_string(&status).unwrap();

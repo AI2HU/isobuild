@@ -1,15 +1,15 @@
-//! Orchestration tests against a scripted backend: which containers are
-//! started, with what isolation, and how their outcomes become a report.
+//! Orchestration tests against a scripted backend: which sandboxes are
+//! started, with what access, and how their outcomes become a report.
 
 use std::collections::VecDeque;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use isobuild::cache::CacheLayout;
 use isobuild::{
-    Backend, BackendError, CargoCommand, ContainerOutcome, ContainerSpec, MountSource, RunRequest,
-    run,
+    Backend, BackendError, CargoCommand, RunRequest, SandboxOutcome, SandboxSpec, Toolchain, run,
 };
 use isobuild_report::{Phase, Severity, Status};
 
@@ -19,7 +19,7 @@ fn fixture(name: &str) -> String {
     fs::read_to_string(Path::new(FIXTURES).join(name)).unwrap()
 }
 
-/// What one container "prints" and how it ends.
+/// What one sandbox "prints" and how it ends.
 #[derive(Default, Clone)]
 struct Step {
     exit_code: i32,
@@ -27,6 +27,7 @@ struct Step {
     stderr: String,
     timed_out: bool,
     oom_killed: bool,
+    process_limit_hit: bool,
 }
 
 impl Step {
@@ -52,25 +53,41 @@ impl Step {
     }
 }
 
-#[derive(Default)]
 struct FakeBackend {
     unavailable: bool,
+    /// A toolchain directory, with `bin/cargo-clippy` unless `no_clippy`.
+    sysroot: tempfile::TempDir,
     steps: Mutex<VecDeque<Step>>,
-    specs: Mutex<Vec<ContainerSpec>>,
-    /// Volumes that exist, shared between runs of one test.
-    volumes: Mutex<Vec<String>>,
-    removed_volumes: Mutex<Vec<String>>,
+    specs: Mutex<Vec<SandboxSpec>>,
+}
+
+impl Default for FakeBackend {
+    fn default() -> Self {
+        let sysroot = tempfile::tempdir().unwrap();
+        fs::create_dir(sysroot.path().join("bin")).unwrap();
+        fs::write(sysroot.path().join("bin/cargo-clippy"), "").unwrap();
+        FakeBackend {
+            unavailable: false,
+            sysroot,
+            steps: Mutex::default(),
+            specs: Mutex::default(),
+        }
+    }
 }
 
 impl FakeBackend {
     fn with(steps: impl IntoIterator<Item = Step>) -> Self {
-        FakeBackend {
-            steps: Mutex::new(steps.into_iter().collect()),
-            ..Default::default()
-        }
+        let backend = FakeBackend::default();
+        backend.push_steps(steps);
+        backend
     }
 
-    fn specs(&self) -> Vec<ContainerSpec> {
+    fn without_clippy(self) -> Self {
+        fs::remove_file(self.sysroot.path().join("bin/cargo-clippy")).unwrap();
+        self
+    }
+
+    fn specs(&self) -> Vec<SandboxSpec> {
         self.specs.lock().unwrap().clone()
     }
 
@@ -80,60 +97,55 @@ impl FakeBackend {
 }
 
 impl Backend for FakeBackend {
+    fn name(&self) -> &'static str {
+        "fake"
+    }
+
     fn preflight(&self) -> Result<(), BackendError> {
         if self.unavailable {
             Err(BackendError::Unavailable(
-                "the Docker daemon is not reachable".into(),
+                "`sandbox-exec` cannot create sandboxes".into(),
             ))
         } else {
             Ok(())
         }
     }
 
-    fn ensure_image(&self, _image: &str) -> Result<String, BackendError> {
-        Ok("sha256:fake".into())
+    fn toolchain(&self, _requested: Option<&str>, cwd: &Path) -> Result<Toolchain, BackendError> {
+        assert!(
+            cwd.join("ISOBUILD_CACHE").is_file(),
+            "resolved outside the project"
+        );
+        let sysroot = self.sysroot.path().canonicalize().unwrap();
+        Ok(Toolchain {
+            version: "rustc 1.91.1 (fake)".into(),
+            id: "fake-toolchain".into(),
+            read_only: vec![sysroot.clone()],
+            sysroot,
+            env: vec![("SDKROOT".into(), "/fake/sdk".into())],
+            tools: vec![("cc".into(), "/usr/bin/true".into())],
+        })
     }
 
-    fn ensure_volume(
-        &self,
-        name: &str,
-        owner: Option<&str>,
-        _image: &str,
-    ) -> Result<bool, BackendError> {
-        assert!(owner.is_some(), "volumes are handed to the sandbox user");
-        let mut volumes = self.volumes.lock().unwrap();
-        if volumes.iter().any(|v| v == name) {
-            return Ok(true);
-        }
-        volumes.push(name.to_string());
-        Ok(false)
-    }
-
-    fn remove_volume(&self, name: &str) {
-        self.volumes.lock().unwrap().retain(|v| v != name);
-        self.removed_volumes.lock().unwrap().push(name.to_string());
-    }
-
-    fn run(&self, spec: &ContainerSpec) -> Result<ContainerOutcome, BackendError> {
+    fn run(&self, spec: &SandboxSpec) -> Result<SandboxOutcome, BackendError> {
         self.specs.lock().unwrap().push(spec.clone());
-        // The staged project must exist while its containers run.
-        assert!(spec.mounts.iter().any(|m| {
-            m.container == "/work"
-                && m.host_path()
-                    .is_some_and(|p| p.join("Cargo.toml").is_file())
-        }));
+        // The staged project must exist while its sandboxes run.
+        assert!(spec.workdir.join("Cargo.toml").is_file());
         let step = self
             .steps
             .lock()
             .unwrap()
             .pop_front()
-            .expect("unexpected container");
-        fs::write(&spec.stdout_path, &step.stdout).unwrap();
-        fs::write(&spec.stderr_path, &step.stderr).unwrap();
-        Ok(ContainerOutcome {
+            .expect("unexpected sandbox");
+        // Fixtures were recorded in /work; move them to the real staged copy.
+        let work = format!("{}/", spec.workdir.display());
+        fs::write(&spec.stdout_path, step.stdout.replace("/work/", &work)).unwrap();
+        fs::write(&spec.stderr_path, step.stderr.replace("/work/", &work)).unwrap();
+        Ok(SandboxOutcome {
             exit_code: Some(step.exit_code),
             timed_out: step.timed_out,
             oom_killed: step.oom_killed,
+            process_limit_hit: step.process_limit_hit,
             duration: Duration::from_millis(5),
             output_truncated: false,
         })
@@ -155,10 +167,15 @@ fn setup(command: CargoCommand) -> Setup {
     Setup { _dir: dir, req }
 }
 
-fn has_mount(spec: &ContainerSpec, container: &str, read_only: bool) -> bool {
-    spec.mounts
+fn env<'a>(spec: &'a SandboxSpec, key: &str) -> Option<&'a str> {
+    spec.env
         .iter()
-        .any(|m| m.container == container && m.read_only == read_only)
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
+}
+
+fn cache(req: &RunRequest) -> CacheLayout {
+    CacheLayout::new(req.cache_dir.canonicalize().unwrap())
 }
 
 #[test]
@@ -179,50 +196,80 @@ fn passing_test_run_uses_three_isolated_phases() {
         report.phases.iter().map(|p| p.phase).collect::<Vec<_>>(),
         [Phase::Fetch, Phase::Build, Phase::Test]
     );
-    assert_eq!(report.environment.as_ref().unwrap().image_id, "sha256:fake");
+    let environment = report.environment.as_ref().unwrap();
+    assert_eq!(environment.backend, "fake");
+    assert_eq!(environment.toolchain_id, "fake-toolchain");
     assert!(!report.cache.as_ref().unwrap().warm);
 
+    let layout = cache(&s.req);
+    let sysroot = backend.sysroot.path().canonicalize().unwrap();
     let specs = backend.specs();
     let (fetch, build, test) = (&specs[0], &specs[1], &specs[2]);
 
     assert!(fetch.network, "fetch downloads dependencies");
-    assert_eq!(fetch.command, ["cargo", "fetch"]);
-    assert!(has_mount(fetch, "/cargo-home", false));
+    assert_eq!(
+        fetch.command[0],
+        sysroot.join("bin/cargo").display().to_string()
+    );
+    assert_eq!(fetch.command[1..], ["fetch"]);
+    assert!(fetch.writable.contains(&layout.cargo_home()));
+    assert_eq!(
+        env(fetch, "CARGO_HOME"),
+        Some(layout.cargo_home().to_str().unwrap())
+    );
     assert!(
-        !fetch.env.iter().any(|(k, _)| k == "RUST_LOG"),
+        env(fetch, "RUST_LOG").is_none(),
         "user env never reaches fetch"
     );
 
-    for spec in [build, test] {
-        assert!(!spec.network, "{} must be offline", spec.name);
-        assert!(has_mount(spec, "/cargo-home/registry", true));
-        assert!(has_mount(spec, "/cargo-home/git", true));
-        assert!(has_mount(spec, "/target", false));
+    for spec in [fetch, build, test] {
         assert!(
-            !has_mount(spec, "/cargo-home", false),
-            "shared cargo home is not writable"
+            spec.read_only.contains(&sysroot),
+            "the toolchain is readable"
         );
-        assert!(spec.env.contains(&("RUST_LOG".into(), "debug".into())));
-        assert!(
-            spec.env
-                .contains(&("CARGO_NET_OFFLINE".into(), "true".into()))
-        );
+        assert_eq!(env(spec, "SDKROOT"), Some("/fake/sdk"));
         assert_eq!(
-            spec.image, "sha256:fake",
-            "pinned to the inspected image id"
+            env(spec, "RUSTC"),
+            Some(sysroot.join("bin/rustc").to_str().unwrap())
+        );
+        assert_eq!(env(spec, "HOME"), env(spec, "TMPDIR"));
+        assert!(spec.writable.contains(&spec.workdir));
+        for path in spec.read_only.iter().chain(&spec.writable) {
+            assert!(path.is_absolute(), "{}", path.display());
+        }
+        assert!(
+            !spec.writable.iter().any(|w| layout.root().starts_with(w)),
+            "the cache root itself is never writable"
         );
     }
+    for spec in [build, test] {
+        assert!(!spec.network, "{} must be offline", spec.name);
+        assert!(spec.read_only.contains(&layout.registry()));
+        assert!(spec.read_only.contains(&layout.git()));
+        assert!(
+            !spec.writable.contains(&layout.cargo_home()),
+            "shared cargo home is not writable"
+        );
+        let private_home = Path::new(env(spec, "CARGO_HOME").unwrap());
+        assert!(spec.writable.iter().any(|w| w == private_home));
+        assert_eq!(env(spec, "RUST_LOG"), Some("debug"));
+        assert_eq!(env(spec, "CARGO_NET_OFFLINE"), Some("true"));
+        let path = env(spec, "PATH").unwrap();
+        assert!(path.starts_with(&format!("{}/bin:", report.log_dir.as_deref().unwrap())));
+    }
     assert_eq!(
-        build.command[..4],
-        ["cargo", "test", "--no-run", "--message-format=json"]
+        build.command[1..4],
+        ["test", "--no-run", "--message-format=json"]
     );
-    assert_eq!(test.command[..3], ["cargo", "test", "--frozen"]);
+    assert_eq!(test.command[1..3], ["test", "--frozen"]);
     assert!(test.command.contains(&"--no-fail-fast".to_string()));
 
-    // Logs are kept, the staged copy is not.
+    // Logs are kept, the sandbox's directories are not.
     let log_dir = Path::new(report.log_dir.as_deref().unwrap());
     assert!(log_dir.join("test.stdout.log").is_file());
-    assert!(!log_dir.join("work").exists());
+    for dir in ["work", "tmp", "cargo-home", "bin"] {
+        assert!(!log_dir.join(dir).exists(), "{dir} left behind");
+    }
 }
 
 #[test]
@@ -236,16 +283,13 @@ fn second_run_reuses_the_build_cache() {
     assert!(!first.cache.as_ref().unwrap().warm);
     assert_eq!(key, &second.cache.as_ref().unwrap().key);
     assert!(second.cache.unwrap().warm);
-    let target = backend.specs()[1]
-        .mounts
-        .iter()
-        .find(|m| m.container == "/target")
-        .cloned()
-        .unwrap();
+    let target = cache(&s.req).target_dir(key);
+    let build = &backend.specs()[3];
     assert_eq!(
-        target.source,
-        MountSource::Volume(format!("isobuild-target-{key}"))
+        env(build, "CARGO_TARGET_DIR"),
+        Some(target.to_str().unwrap())
     );
+    assert!(build.writable.contains(&target));
 }
 
 #[test]
@@ -260,28 +304,60 @@ fn other_projects_get_their_own_build_cache() {
 }
 
 #[test]
-fn no_cache_uses_a_throwaway_target_volume() {
+fn no_cache_uses_a_throwaway_target_directory() {
     let mut s = setup(CargoCommand::Build);
     s.req.build_cache = false;
     let backend = FakeBackend::with([Step::ok(), Step::ok()]);
     let report = run(&s.req, &backend);
     assert_eq!(report.status, Status::Ok);
     assert!(report.cache.is_none());
-    let target = backend.specs()[1]
-        .mounts
-        .iter()
-        .find(|m| m.container == "/target")
-        .cloned()
-        .unwrap();
-    let MountSource::Volume(name) = target.source else {
-        panic!("target is a volume")
-    };
-    assert!(name.starts_with("isobuild-run-"));
+    let target = PathBuf::from(env(&backend.specs()[1], "CARGO_TARGET_DIR").unwrap());
     assert_eq!(
-        *backend.removed_volumes.lock().unwrap(),
-        [name],
-        "removed after the run"
+        target,
+        Path::new(report.log_dir.as_deref().unwrap()).join("target")
     );
+    assert!(!target.exists(), "removed after the run");
+}
+
+#[test]
+fn private_cargo_home_links_to_the_shared_sources() {
+    struct Checking(FakeBackend);
+    impl Backend for Checking {
+        fn name(&self) -> &'static str {
+            self.0.name()
+        }
+        fn preflight(&self) -> Result<(), BackendError> {
+            self.0.preflight()
+        }
+        fn toolchain(
+            &self,
+            requested: Option<&str>,
+            cwd: &Path,
+        ) -> Result<Toolchain, BackendError> {
+            self.0.toolchain(requested, cwd)
+        }
+        fn run(&self, spec: &SandboxSpec) -> Result<SandboxOutcome, BackendError> {
+            if !spec.network {
+                let home = Path::new(env(spec, "CARGO_HOME").unwrap());
+                for dir in ["registry", "git"] {
+                    let link = fs::read_link(home.join(dir)).unwrap();
+                    assert!(spec.read_only.contains(&link), "{dir} is read-only");
+                }
+                let cc = spec.read_only.iter().find(|p| p.ends_with("bin")).unwrap();
+                assert_eq!(
+                    fs::read_link(cc.join("cc")).unwrap(),
+                    Path::new("/usr/bin/true")
+                );
+            }
+            self.0.run(spec)
+        }
+    }
+    let s = setup(CargoCommand::Check);
+    let report = run(
+        &s.req,
+        &Checking(FakeBackend::with([Step::ok(), Step::ok()])),
+    );
+    assert_eq!(report.status, Status::Ok);
 }
 
 #[test]
@@ -364,7 +440,7 @@ fn crashed_test_binary_without_failures_still_fails() {
         Step::ok(),
         Step::exit(101)
             .stdout("running 1 test\n")
-            .stderr("error: test failed, to rerun pass `--lib`\n\nCaused by:\n  process didn't exit successfully: `/target/debug/deps/demo-1` (signal: 11, SIGSEGV: invalid memory reference)\n"),
+            .stderr("error: test failed, to rerun pass `--lib`\n\nCaused by:\n  process didn't exit successfully: `/cache/target/debug/deps/demo-1` (signal: 11, SIGSEGV: invalid memory reference)\n"),
     ]);
     let report = run(&s.req, &backend);
     assert_eq!(report.status, Status::TestFailed);
@@ -453,7 +529,7 @@ fn locked_and_offline_change_the_commands() {
     s.req.cargo.locked = true;
     let backend = FakeBackend::with([Step::ok(), Step::ok()]);
     run(&s.req, &backend);
-    assert_eq!(backend.specs()[0].command, ["cargo", "fetch", "--locked"]);
+    assert_eq!(backend.specs()[0].command[1..], ["fetch", "--locked"]);
 
     s.req.offline = true;
     let backend = FakeBackend::with([Step::ok()]);
@@ -468,6 +544,13 @@ fn locked_and_offline_change_the_commands() {
 #[test]
 fn missing_clippy_is_infra_not_a_code_error() {
     let s = setup(CargoCommand::Clippy);
+    let backend = FakeBackend::default().without_clippy();
+    let report = run(&s.req, &backend);
+    assert_eq!(report.status, Status::InfraError);
+    assert_eq!(report.failed_phase, Some(Phase::Prepare));
+    assert!(report.summary.contains("rustup component add clippy"));
+    assert!(backend.specs().is_empty());
+
     let backend = FakeBackend::with([
         Step::ok(),
         Step::exit(101).stderr("error: no such command: `clippy`\n"),
@@ -475,6 +558,39 @@ fn missing_clippy_is_infra_not_a_code_error() {
     let report = run(&s.req, &backend);
     assert_eq!(report.status, Status::InfraError);
     assert!(report.summary.contains("does not provide `cargo clippy`"));
+}
+
+#[test]
+fn too_many_processes_is_its_own_status() {
+    let s = setup(CargoCommand::Test);
+    let backend = FakeBackend::with([
+        Step::ok(),
+        Step::ok(),
+        Step {
+            exit_code: 137,
+            process_limit_hit: true,
+            ..Default::default()
+        },
+    ]);
+    let report = run(&s.req, &backend);
+    assert_eq!(report.status, Status::ProcessLimit);
+    assert_eq!(
+        report.summary,
+        "ran more than 1024 processes at once in the test phase"
+    );
+    assert!(report.phases[2].process_limit_hit);
+}
+
+#[test]
+fn diagnostics_are_relative_to_the_project() {
+    let s = setup(CargoCommand::Check);
+    let backend = FakeBackend::with([
+        Step::ok(),
+        Step::exit(101).stdout(fixture("compile_err.stdout")),
+    ]);
+    let report = run(&s.req, &backend);
+    let location = report.diagnostics[0].location.as_ref().unwrap();
+    assert_eq!(location.file, "src/lib.rs");
 }
 
 #[test]
@@ -507,32 +623,21 @@ fn toolchain_file_is_left_out_of_the_sandbox() {
 
     struct Checking(FakeBackend);
     impl Backend for Checking {
+        fn name(&self) -> &'static str {
+            self.0.name()
+        }
         fn preflight(&self) -> Result<(), BackendError> {
             self.0.preflight()
         }
-        fn ensure_image(&self, image: &str) -> Result<String, BackendError> {
-            self.0.ensure_image(image)
-        }
-        fn ensure_volume(
+        fn toolchain(
             &self,
-            name: &str,
-            owner: Option<&str>,
-            image: &str,
-        ) -> Result<bool, BackendError> {
-            self.0.ensure_volume(name, owner, image)
+            requested: Option<&str>,
+            cwd: &Path,
+        ) -> Result<Toolchain, BackendError> {
+            self.0.toolchain(requested, cwd)
         }
-        fn remove_volume(&self, name: &str) {
-            self.0.remove_volume(name)
-        }
-        fn run(&self, spec: &ContainerSpec) -> Result<ContainerOutcome, BackendError> {
-            let work = spec
-                .mounts
-                .iter()
-                .find(|m| m.container == "/work")
-                .unwrap()
-                .host_path()
-                .unwrap();
-            assert!(!work.join("rust-toolchain.toml").exists());
+        fn run(&self, spec: &SandboxSpec) -> Result<SandboxOutcome, BackendError> {
+            assert!(!spec.workdir.join("rust-toolchain.toml").exists());
             self.0.run(spec)
         }
     }
@@ -550,7 +655,7 @@ fn toolchain_file_is_left_out_of_the_sandbox() {
 }
 
 #[test]
-fn unreachable_docker_is_infra() {
+fn unusable_sandbox_is_infra() {
     let s = setup(CargoCommand::Check);
     let backend = FakeBackend {
         unavailable: true,
@@ -559,7 +664,7 @@ fn unreachable_docker_is_infra() {
     let report = run(&s.req, &backend);
     assert_eq!(report.status, Status::InfraError);
     assert_eq!(report.failed_phase, Some(Phase::Prepare));
-    assert!(report.summary.contains("not reachable"));
+    assert!(report.summary.contains("cannot create sandboxes"));
 }
 
 #[test]

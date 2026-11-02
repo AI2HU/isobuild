@@ -3,10 +3,12 @@
 //! ```text
 //! <root>/
 //!   cargo-home/            CARGO_HOME for the fetch phase (read-write)
-//!     registry/ git/       mounted read-only into build and test phases
+//!     registry/ git/       read-only in the build and test phases
 //!   fetch.lock             serialises fetches that write to cargo-home
-//!   targets/<key>/         last-use stamp of the build cache volume `isobuild-target-<key>`
-//!   runs/<id>/             logs of one run, plus its staged project while it runs
+//!   targets/<key>/         one build cache
+//!     target/              CARGO_TARGET_DIR (read-write)
+//!     .isobuild-last-used  stamp for pruning, out of the sandbox's reach
+//!   runs/<id>/             logs of one run, plus its sandbox directories while it runs
 //! ```
 //!
 //! Trust rules: only the fetch phase writes to `cargo-home`, and it runs
@@ -63,8 +65,14 @@ impl CacheLayout {
         self.cargo_home().join("git")
     }
 
+    /// The build cache `key`: its target directory and last-use stamp.
     pub fn target(&self, key: &str) -> PathBuf {
         self.root.join("targets").join(key)
+    }
+
+    /// The target directory of the build cache `key`.
+    pub fn target_dir(&self, key: &str) -> PathBuf {
+        self.target(key).join("target")
     }
 
     pub fn runs(&self) -> PathBuf {
@@ -122,9 +130,8 @@ impl CacheLayout {
         fs::write(self.target(key).join(LAST_USED), "")
     }
 
-    /// Delete run logs older than `runs_older_than` and build-cache stamps
-    /// unused for `targets_older_than`. Returns the keys of the build caches
-    /// removed, so the caller can delete their volumes.
+    /// Delete run logs older than `runs_older_than` and build caches unused
+    /// for `targets_older_than`.
     pub fn prune(&self, runs_older_than: Duration, targets_older_than: Duration) -> Pruned {
         let runs = remove_stale(&self.runs(), runs_older_than, |dir| dir.to_path_buf());
         let targets = remove_stale(&self.root.join("targets"), targets_older_than, |dir| {
@@ -164,23 +171,47 @@ fn remove_stale(
             Ok(time) => now.duration_since(time).unwrap_or_default() > older_than,
             Err(_) => false,
         };
-        if stale && fs::remove_dir_all(&dir).is_ok() {
+        if stale && remove_tree(&dir).is_ok() {
             removed.push(entry.file_name().to_string_lossy().into_owned());
         }
     }
     removed
 }
 
-/// Key of the build cache for a scope and an image.
+/// Delete `path` and everything under it without following symlinks, even
+/// when sandboxed code removed write permission from directories inside it.
+pub fn remove_tree(path: &Path) -> io::Result<()> {
+    match fs::remove_dir_all(path) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(_) => {
+            make_writable(path);
+            fs::remove_dir_all(path)
+        }
+        ok => ok,
+    }
+}
+
+fn make_writable(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if !fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) {
+        return;
+    }
+    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        make_writable(&entry.path());
+    }
+}
+
+/// Key of the build cache for a scope and a toolchain.
 ///
-/// The image id pins the toolchain, so a toolchain upgrade starts a new cache
-/// instead of mixing artifacts. Cargo's own fingerprints take care of feature,
-/// profile and dependency changes within one cache.
-pub fn build_cache_key(scope: &str, image_id: &str) -> String {
+/// A toolchain upgrade starts a new cache instead of mixing artifacts.
+/// Cargo's own fingerprints take care of feature, profile and dependency
+/// changes within one cache.
+pub fn build_cache_key(scope: &str, toolchain_id: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(scope.as_bytes());
     hasher.update([0]);
-    hasher.update(image_id.as_bytes());
+    hasher.update(toolchain_id.as_bytes());
     let digest = hasher.finalize();
     digest[..16].iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -259,6 +290,29 @@ mod tests {
         assert!(!run.exists());
         assert!(!layout.target("k").exists());
         assert!(!layout.target("never-touched").exists());
+    }
+
+    #[test]
+    fn remove_tree_handles_read_only_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let tree = dir.path().join("tree");
+        fs::create_dir_all(tree.join("locked/inner")).unwrap();
+        fs::write(tree.join("locked/inner/file"), "x").unwrap();
+        let outside = dir.path().join("outside");
+        fs::write(&outside, "keep").unwrap();
+        std::os::unix::fs::symlink(&outside, tree.join("locked/link")).unwrap();
+        for d in ["locked/inner", "locked"] {
+            fs::set_permissions(tree.join(d), fs::Permissions::from_mode(0o500)).unwrap();
+        }
+        remove_tree(&tree).unwrap();
+        assert!(!tree.exists());
+        assert_eq!(
+            fs::read_to_string(&outside).unwrap(),
+            "keep",
+            "links are not followed"
+        );
+        remove_tree(&tree).unwrap();
     }
 
     #[test]

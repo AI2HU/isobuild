@@ -1,5 +1,5 @@
 //! The binary's contract: JSON on stdout and documented exit codes. These
-//! cases stop before any container starts, so they need no Docker.
+//! cases stop before any sandbox starts.
 
 use std::fs;
 use std::process::{Command, Output};
@@ -8,8 +8,8 @@ fn cargo_sandbox(args: &[&str], cache: &std::path::Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_cargo-sandbox"))
         .args(args)
         .env("ISOBUILD_CACHE", cache)
-        // Make sure nothing reaches a real daemon even if a case goes further than expected.
-        .env("ISOBUILD_DOCKER", "/nonexistent/docker")
+        // Make sure nothing runs even if a case goes further than expected.
+        .env("ISOBUILD_SANDBOX_PROGRAM", "/nonexistent/sandbox")
         .output()
         .unwrap()
 }
@@ -45,7 +45,7 @@ fn policy_denial_exits_2_with_a_json_report() {
     );
     assert_eq!(out.status.code(), Some(2));
     let report = json(&out);
-    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["schema_version"], 2);
     assert_eq!(report["status"], "policy_denied");
     assert_eq!(report["failed_phase"], "prepare");
     assert_eq!(report["policy"][0]["rule"], "cargo-config.custom-rustc");
@@ -69,7 +69,7 @@ fn works_as_a_cargo_subcommand() {
 }
 
 #[test]
-fn missing_docker_exits_4() {
+fn missing_sandbox_tool_exits_4() {
     let project = project_with_config("[build]\njobs = 2\n");
     let cache = tempfile::tempdir().unwrap();
     let out = cargo_sandbox(
@@ -83,7 +83,7 @@ fn missing_docker_exits_4() {
         report["summary"]
             .as_str()
             .unwrap()
-            .contains("/nonexistent/docker")
+            .contains("/nonexistent/sandbox")
     );
 }
 

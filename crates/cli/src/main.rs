@@ -2,9 +2,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use isobuild::cache::CacheLayout;
-use isobuild::docker::{remove_active_containers, remove_all_volumes};
-use isobuild::{CargoCommand, CargoOptions, DEFAULT_IMAGE, DockerBackend, RunRequest, render, run};
+use isobuild::cache::{CacheLayout, remove_tree};
+use isobuild::{CargoCommand, CargoOptions, RunRequest, default_backend, kill_active, render, run};
 use isobuild_report::{Limits, Status};
 
 /// Build and test untrusted Rust projects in a sandbox.
@@ -13,8 +12,8 @@ use isobuild_report::{Limits, Status};
 /// and tested without any. The result is a JSON report on stdout.
 ///
 /// Exit codes: 0 ok, 1 the project failed to fetch, build or test,
-/// 2 the request or project was refused, 3 a timeout or memory limit was hit,
-/// 4 the sandbox itself failed.
+/// 2 the request or project was refused, 3 a time, memory or process limit
+/// was hit, 4 the sandbox itself failed.
 #[derive(Parser)]
 #[command(name = "cargo-sandbox", bin_name = "cargo sandbox", version)]
 struct Cli {
@@ -58,9 +57,10 @@ struct RunArgs {
     /// Output format.
     #[arg(long, value_enum, default_value_t = Format::Json)]
     format: Format,
-    /// Docker image with the toolchain. Pin it by digest for reproducible runs.
-    #[arg(long, env = "ISOBUILD_IMAGE", default_value = DEFAULT_IMAGE)]
-    image: String,
+    /// Rustup toolchain, e.g. `stable` or `1.91.1` [default: the host's default].
+    /// The project's rust-toolchain.toml is ignored.
+    #[arg(long, env = "ISOBUILD_TOOLCHAIN")]
+    toolchain: Option<String>,
     /// Cache directory [default: ~/.cache/isobuild].
     #[arg(long, env = "ISOBUILD_CACHE")]
     cache_dir: Option<PathBuf>,
@@ -140,7 +140,7 @@ impl RunArgs {
         };
         req.test_args = test_args;
         req.env = self.env;
-        req.image = self.image;
+        req.toolchain = self.toolchain;
         req.limits = Limits {
             memory_mb: self.memory_mb,
             cpus: self.cpus,
@@ -163,7 +163,7 @@ fn exit_code(status: Status) -> u8 {
         Status::Ok => 0,
         Status::FetchFailed | Status::BuildFailed | Status::TestFailed => 1,
         Status::InvalidRequest | Status::PolicyDenied => 2,
-        Status::Timeout | Status::Oom => 3,
+        Status::Timeout | Status::Oom | Status::ProcessLimit => 3,
         Status::InfraError => 4,
     }
 }
@@ -187,11 +187,11 @@ fn main() -> ExitCode {
     };
 
     let _ = ctrlc::set_handler(|| {
-        remove_active_containers();
+        kill_active();
         std::process::exit(130);
     });
 
-    let report = run(&req, &DockerBackend::new());
+    let report = run(&req, default_backend().as_ref());
     match format {
         Format::Json => match serde_json::to_string_pretty(&report) {
             Ok(json) => println!("{json}"),
@@ -206,10 +206,6 @@ fn main() -> ExitCode {
 }
 
 fn clean(root: PathBuf) -> ExitCode {
-    let volumes = remove_all_volumes(&DockerBackend::new());
-    if volumes > 0 {
-        eprintln!("removed {volumes} build cache volumes");
-    }
     let layout = CacheLayout::new(&root);
     if !root.exists() {
         return ExitCode::SUCCESS;
@@ -221,7 +217,7 @@ fn clean(root: PathBuf) -> ExitCode {
         );
         return ExitCode::from(2);
     }
-    match std::fs::remove_dir_all(&root) {
+    match remove_tree(&root) {
         Ok(()) => {
             eprintln!("removed {}", root.display());
             ExitCode::SUCCESS

@@ -1,8 +1,8 @@
-//! Copy a project into the directory that is mounted into the sandbox.
+//! Copy a project into the directory the sandbox works in.
 //!
 //! The copy never follows symlinks. Links are recreated as links, so a link
-//! to `~/.ssh/id_rsa` dangles inside the container instead of carrying the
-//! key in. Build output (`target/` and anything cargo marked with
+//! to `~/.ssh/id_rsa` points at a file the sandbox cannot read instead of
+//! carrying the key in. Build output (`target/` and anything cargo marked with
 //! `CACHEDIR.TAG`) is skipped: it is large, and it was produced outside the
 //! sandbox.
 
